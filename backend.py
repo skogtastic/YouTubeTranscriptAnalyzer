@@ -1,54 +1,32 @@
+
 import re
-from youtube_transcript_api import YouTubeTranscriptApi
-from pytube import YouTube
-from openai import OpenAI
+from collections import Counter
 
-client = OpenAI()
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s]", "", text)
+    return text.strip()
 
-def get_video_id(url):
-    pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
-    match = re.search(pattern, url)
-    if not match:
-        raise ValueError("Invalid YouTube URL")
-    return match.group(1)
+def simple_summarize(text: str, num_sentences: int = 5) -> str:
+    if not text:
+        return "No transcript provided."
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) <= num_sentences:
+        return text
+    cleaned = clean_text(text)
+    words = cleaned.split()
+    word_freq = Counter(words)
+    ranked = []
+    for sentence in sentences:
+        score = sum(word_freq.get(w, 0) for w in clean_text(sentence).split())
+        ranked.append((score, sentence))
+    ranked.sort(reverse=True)
+    return " ".join([s for _, s in ranked[:num_sentences]])
 
-def get_transcript(video_id):
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
-    return " ".join(item["text"] for item in transcript)
-
-def summarize_and_structure(transcript):
-    prompt = f"""
-    Analyze this YouTube transcript.
-
-    Return:
-    1. A concise summary (max 200 words)
-    2. A structured outline of the video sections
-
-    Transcript:
-    {transcript[:15000]}
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    content = response.choices[0].message.content
-
-    return content
-
-def process_video(url):
-    video_id = get_video_id(url)
-    yt = YouTube(url)
-
-    title = yt.title
-    transcript = get_transcript(video_id)
-
-    analysis = summarize_and_structure(transcript)
-
+def process_video(transcript_text: str) -> dict:
     return {
-        "title": title,
-        "transcript": transcript,
-        "summary": analysis,
-        "structure": analysis
+        "summary": simple_summarize(transcript_text),
+        "word_count": len(transcript_text.split()) if transcript_text else 0,
+        "raw_transcript": transcript_text
     }

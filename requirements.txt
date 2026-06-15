@@ -1,4 +1,1 @@
 streamlit
-youtube-transcript-api
-pytube
-openai
