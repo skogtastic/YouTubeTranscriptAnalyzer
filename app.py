@@ -19,17 +19,12 @@ import re
 import os
 import time
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import anthropic
 import streamlit as st
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-)
+from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -78,45 +73,52 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
-def parse_urls(raw: str) -> list[str]:
+def parse_urls(raw: str) -> list:
     """Split newline- or comma-separated URLs and strip blanks."""
     return [u.strip() for u in re.split(r"[\n,]+", raw) if u.strip()]
 
 
 def fetch_transcript(video_id: str) -> str:
     """
-    Fetch the transcript for a video ID using youtube-transcript-api v0.7+.
-    The new API requires instantiating YouTubeTranscriptApi() rather than
-    calling class methods directly.
-    Prefers manually created captions, falls back to auto-generated ones.
-    Returns the full transcript as a single string.
-    Raises a descriptive exception on failure.
+    Fetch the transcript for a video ID using youtube-transcript-api v1.2+.
+
+    v1.2.0 removed list_transcripts / get_transcript / get_transcripts entirely.
+    The new API is:
+        ytt = YouTubeTranscriptApi()
+        fetched = ytt.fetch(video_id)               # fetches default/best language
+        text = " ".join(s.text for s in fetched)
+
+    To prefer English and fall back gracefully we use ytt.list() then ytt.fetch()
+    with an explicit language preference list.
     """
     ytt = YouTubeTranscriptApi()
-    transcript_list = ytt.list_transcripts(video_id)
 
-    # Try manually created first, then auto-generated
-    transcript = None
+    # Try fetching English directly first — fastest path
     try:
-        transcript = transcript_list.find_manually_created_transcript(
-            ["en", "en-US", "en-GB"]
-        )
-    except NoTranscriptFound:
-        try:
-            transcript = transcript_list.find_generated_transcript(["en"])
-        except NoTranscriptFound:
-            # Take whatever language is available and translate to English
-            available = list(transcript_list)
-            if not available:
-                raise NoTranscriptFound(video_id, [], [])
-            transcript = available[0].translate("en")
+        fetched = ytt.fetch(video_id, languages=["en", "en-US", "en-GB", "en-CA", "en-AU"])
+        return " ".join(s.text for s in fetched)
+    except Exception:
+        pass
 
-    data = transcript.fetch()
-    # v0.7+ returns FetchedTranscript objects; each has a .text attribute
-    # but also supports dict-style access for backwards compatibility
-    return " ".join(
-        entry.text if hasattr(entry, "text") else entry["text"]
-        for entry in data
+    # Fall back: list available transcripts, pick any and translate to English
+    try:
+        transcript_list = ytt.list(video_id)
+        # transcript_list is iterable; grab the first available
+        for transcript in transcript_list:
+            try:
+                if transcript.is_translatable:
+                    fetched = transcript.translate("en").fetch()
+                else:
+                    fetched = transcript.fetch()
+                return " ".join(s.text for s in fetched)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not retrieve a transcript. The video may have no captions, "
+        "be private, age-restricted, or blocked in this region."
     )
 
 
@@ -176,7 +178,7 @@ Transcript:
         return {"summary": raw, "key_points": [], "themes": [], "sentiment": "unknown", "speaker_tone": ""}
 
 
-def cross_video_analysis(client: anthropic.Anthropic, results: list[VideoResult]) -> dict:
+def cross_video_analysis(client: anthropic.Anthropic, results: list) -> dict:
     """
     Ask Claude to identify patterns, narratives, and themes across all videos.
     Returns a dict with keys: overarching_themes, common_narrative,
@@ -212,7 +214,7 @@ Transcripts:
                 "content_diversity": "", "recommendations": ""}
 
 
-def export_results_as_text(results: list[VideoResult], cross: Optional[dict]) -> str:
+def export_results_as_text(results: list, cross: Optional[dict]) -> str:
     """Serialize all results to a plain-text report for download."""
     lines = ["YouTube Transcript Analysis Report", "=" * 50, ""]
 
@@ -396,7 +398,7 @@ def main():
     # ── Analysis ──────────────────────────────────────────────────────────────
     if run_button and valid_urls and api_key:
         client  = anthropic.Anthropic(api_key=api_key)
-        results: list[VideoResult] = []
+        results = []
 
         progress_bar = st.progress(0, text="Starting…")
         status_text  = st.empty()
@@ -409,14 +411,8 @@ def main():
             status_text.markdown(f"**[{idx+1}/{len(valid_urls)}]** Fetching transcript for `{url}` …")
             try:
                 result.transcript = fetch_transcript(video_id)
-            except TranscriptsDisabled:
-                result.error = "Transcripts are disabled for this video."
-            except VideoUnavailable:
-                result.error = "Video is unavailable (private, deleted, or region-locked)."
-            except NoTranscriptFound:
-                result.error = "No transcript found. The video may not have captions."
             except Exception as e:
-                result.error = f"Unexpected error fetching transcript: {e}"
+                result.error = str(e)
 
             # Step 2 — analyze with Claude
             if result.transcript:
