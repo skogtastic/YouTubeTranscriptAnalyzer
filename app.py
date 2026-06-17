@@ -1,29 +1,30 @@
 """
-YouTube Transcript Analyzer — Streamlit App
-============================================
-Fetches transcripts for a batch of YouTube URLs, summarizes each one,
-then produces a cross-video thematic analysis using the Anthropic API.
+YouTube Transcript Analyzer — Streamlit App (Free / Gemini version)
+=====================================================================
+Fetches transcripts for a batch of YouTube URLs and displays the raw
+transcript text. Uses Google Gemini (free tier) for summarization.
 
 Setup:
-    pip install streamlit anthropic youtube-transcript-api python-dotenv
+    pip install streamlit youtube-transcript-api google-generativeai python-dotenv
+
+Get a free Gemini API key (no credit card) at: https://aistudio.google.com
 
 Run locally:
     streamlit run app.py
 
 Deploy to Streamlit Cloud:
-    Push to GitHub, connect at share.streamlit.io, add ANTHROPIC_API_KEY
+    Push to GitHub, connect at share.streamlit.io, add GEMINI_API_KEY
     under Settings → Secrets.
 """
 
 import re
 import os
-import time
 import json
 from dataclasses import dataclass
 from typing import Optional
 
-import anthropic
 import streamlit as st
+import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
 
@@ -31,14 +32,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Best-value model for transcript analysis — fast and cost-efficient.
-# See: https://platform.claude.com/docs/en/about-claude/models/overview
-MODEL = "claude-haiku-4-5-20251001"
-
-MAX_TRANSCRIPT_CHARS = 8_000   # characters sent to Claude per video
-MAX_CROSS_CHARS      = 2_000   # characters per video for cross-video analysis
-RETRY_ATTEMPTS       = 3
-RETRY_DELAY_SECS     = 2
+MAX_TRANSCRIPT_CHARS = 8_000
+MAX_CROSS_CHARS      = 2_000
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -58,13 +53,12 @@ class VideoResult:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def extract_video_id(url: str) -> Optional[str]:
-    """Parse a YouTube URL and return the 11-character video ID, or None."""
     patterns = [
         r"(?:youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})",
         r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})",
         r"(?:youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
         r"(?:youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
-        r"^([a-zA-Z0-9_-]{11})$",  # bare ID
+        r"^([a-zA-Z0-9_-]{11})$",
     ]
     for pattern in patterns:
         m = re.search(pattern, url.strip())
@@ -74,37 +68,22 @@ def extract_video_id(url: str) -> Optional[str]:
 
 
 def parse_urls(raw: str) -> list:
-    """Split newline- or comma-separated URLs and strip blanks."""
     return [u.strip() for u in re.split(r"[\n,]+", raw) if u.strip()]
 
 
 def fetch_transcript(video_id: str) -> str:
-    """
-    Fetch the transcript for a video ID using youtube-transcript-api v1.2+.
-
-    v1.2.0 removed list_transcripts / get_transcript / get_transcripts entirely.
-    The new API is:
-        ytt = YouTubeTranscriptApi()
-        fetched = ytt.fetch(video_id)               # fetches default/best language
-        text = " ".join(s.text for s in fetched)
-
-    To prefer English and fall back gracefully we use ytt.list() then ytt.fetch()
-    with an explicit language preference list.
-    """
     ytt = YouTubeTranscriptApi()
 
-    # Try fetching English directly first — fastest path
+    # Try English first
     try:
         fetched = ytt.fetch(video_id, languages=["en", "en-US", "en-GB", "en-CA", "en-AU"])
         return " ".join(s.text for s in fetched)
     except Exception:
         pass
 
-    # Fall back: list available transcripts, pick any and translate to English
+    # Fall back to any available language, translate to English
     try:
-        transcript_list = ytt.list(video_id)
-        # transcript_list is iterable; grab the first available
-        for transcript in transcript_list:
+        for transcript in ytt.list(video_id):
             try:
                 if transcript.is_translatable:
                     fetched = transcript.translate("en").fetch()
@@ -122,37 +101,12 @@ def fetch_transcript(video_id: str) -> str:
     )
 
 
-def call_claude(client: anthropic.Anthropic, prompt: str, retries: int = RETRY_ATTEMPTS) -> str:
-    """
-    Call the Claude API with simple retry logic for transient errors.
-    Returns the response text.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            message = client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return message.content[0].text
-        except anthropic.RateLimitError:
-            if attempt < retries:
-                time.sleep(RETRY_DELAY_SECS * attempt)
-            else:
-                raise
-        except anthropic.APIStatusError as e:
-            if attempt < retries and e.status_code >= 500:
-                time.sleep(RETRY_DELAY_SECS * attempt)
-            else:
-                raise
+def call_gemini(model, prompt: str) -> str:
+    response = model.generate_content(prompt)
+    return response.text
 
 
-def analyze_transcript(client: anthropic.Anthropic, transcript: str) -> dict:
-    """
-    Ask Claude to summarize and extract structured insights from a transcript.
-    Returns a dict with keys: summary, key_points, themes, sentiment, speaker_tone.
-    Falls back to raw text if JSON parsing fails.
-    """
+def analyze_transcript(model, transcript: str) -> dict:
     prompt = f"""Analyze the YouTube video transcript below and respond with ONLY a valid JSON
 object — no markdown fences, no explanation.
 
@@ -168,28 +122,20 @@ Schema:
 Transcript:
 {transcript[:MAX_TRANSCRIPT_CHARS]}
 """
-    raw = call_claude(client, prompt)
-    # Strip stray code fences in case the model adds them
+    raw = call_gemini(model, prompt)
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
-        # Graceful fallback: wrap raw response so the UI still has something to show
         return {"summary": raw, "key_points": [], "themes": [], "sentiment": "unknown", "speaker_tone": ""}
 
 
-def cross_video_analysis(client: anthropic.Anthropic, results: list) -> dict:
-    """
-    Ask Claude to identify patterns, narratives, and themes across all videos.
-    Returns a dict with keys: overarching_themes, common_narrative,
-    notable_patterns, content_diversity, recommendations.
-    """
+def cross_video_analysis(model, results: list) -> dict:
     snippets = "\n\n---\n\n".join(
         f"VIDEO {i+1} ({r.url}):\n{r.transcript[:MAX_CROSS_CHARS]}"
         for i, r in enumerate(results)
         if r.success
     )
-
     prompt = f"""You are analyzing transcripts from {len(results)} YouTube videos.
 Identify cross-video patterns and respond with ONLY valid JSON — no markdown fences.
 
@@ -205,7 +151,7 @@ Schema:
 Transcripts:
 {snippets}
 """
-    raw = call_claude(client, prompt)
+    raw = call_gemini(model, prompt)
     clean = re.sub(r"```(?:json)?|```", "", raw).strip()
     try:
         return json.loads(clean)
@@ -214,31 +160,30 @@ Transcripts:
                 "content_diversity": "", "recommendations": ""}
 
 
-def export_results_as_text(results: list, cross: Optional[dict]) -> str:
-    """Serialize all results to a plain-text report for download."""
-    lines = ["YouTube Transcript Analysis Report", "=" * 50, ""]
-
+def export_report(results: list, cross: Optional[dict]) -> str:
+    lines = ["YouTube Transcript Report", "=" * 50, ""]
     for i, r in enumerate(results, 1):
         lines.append(f"VIDEO {i}: {r.url}")
         lines.append("-" * 40)
         if r.error:
             lines.append(f"ERROR: {r.error}")
-        elif r.analysis:
-            lines.append(f"Summary: {r.analysis.get('summary', '')}")
-            lines.append(f"Sentiment: {r.analysis.get('sentiment', '')}")
-            lines.append(f"Speaker Tone: {r.analysis.get('speaker_tone', '')}")
-            lines.append("\nKey Points:")
-            for kp in r.analysis.get("key_points", []):
-                lines.append(f"  • {kp}")
-            lines.append("\nThemes: " + ", ".join(r.analysis.get("themes", [])))
-            lines.append("\nRaw Transcript (first 1000 chars):")
-            lines.append((r.transcript or "")[:1000] + "…")
+        elif r.transcript:
+            if r.analysis:
+                lines.append(f"Summary: {r.analysis.get('summary', '')}")
+                lines.append(f"Sentiment: {r.analysis.get('sentiment', '')}")
+                lines.append(f"Speaker Tone: {r.analysis.get('speaker_tone', '')}")
+                lines.append("\nKey Points:")
+                for kp in r.analysis.get("key_points", []):
+                    lines.append(f"  • {kp}")
+                lines.append("Themes: " + ", ".join(r.analysis.get("themes", [])))
+                lines.append("")
+            lines.append("FULL TRANSCRIPT:")
+            lines.append(r.transcript)
         lines.append("")
 
     if cross:
         lines += [
-            "CROSS-VIDEO ANALYSIS",
-            "=" * 50,
+            "CROSS-VIDEO ANALYSIS", "=" * 50,
             f"Common Narrative: {cross.get('common_narrative', '')}",
             "",
             "Overarching Themes: " + ", ".join(cross.get("overarching_themes", [])),
@@ -249,14 +194,12 @@ def export_results_as_text(results: list, cross: Optional[dict]) -> str:
             "",
             f"Recommendations: {cross.get('recommendations', '')}",
         ]
-
     return "\n".join(lines)
 
 
 # ─── UI helpers ───────────────────────────────────────────────────────────────
 
-def render_analysis_card(result: VideoResult, index: int):
-    """Render a single video's result as an expandable Streamlit section."""
+def render_card(result: VideoResult, index: int):
     label = f"Video {index}: `{result.url}`"
 
     if result.error:
@@ -264,51 +207,45 @@ def render_analysis_card(result: VideoResult, index: int):
             st.error(result.error)
         return
 
-    if not result.analysis:
-        with st.expander(f"⏳ {label}", expanded=False):
-            st.info("Processing…")
-        return
-
-    a = result.analysis
     with st.expander(f"✅ {label}", expanded=True):
-        st.markdown(f"**Summary**\n\n{a.get('summary', '')}")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"**Sentiment:** {a.get('sentiment', '—')}")
-        with col2:
-            st.markdown(f"**Tone:** {a.get('speaker_tone', '—')}")
+        # ── Analysis (if available) ───────────────────────────────────────────
+        if result.analysis:
+            a = result.analysis
+            st.markdown(f"**Summary**\n\n{a.get('summary', '')}")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Sentiment:** {a.get('sentiment', '—')}")
+            with col2:
+                st.markdown(f"**Tone:** {a.get('speaker_tone', '—')}")
+            if a.get("key_points"):
+                st.markdown("**Key Points**")
+                for kp in a["key_points"]:
+                    st.markdown(f"- {kp}")
+            if a.get("themes"):
+                st.markdown("**Themes:** " + " · ".join(f"`{t}`" for t in a["themes"]))
+            st.divider()
 
-        if a.get("key_points"):
-            st.markdown("**Key Points**")
-            for kp in a["key_points"]:
-                st.markdown(f"- {kp}")
-
-        if a.get("themes"):
-            st.markdown("**Themes:** " + " · ".join(f"`{t}`" for t in a["themes"]))
-
-        with st.expander("📄 Raw transcript", expanded=False):
-            st.text_area(
-                label="transcript",
-                value=result.transcript or "",
-                height=200,
-                label_visibility="collapsed",
-            )
+        # ── Raw transcript ────────────────────────────────────────────────────
+        st.markdown("**📄 Full Raw Transcript**")
+        st.text_area(
+            label="raw",
+            value=result.transcript or "",
+            height=300,
+            label_visibility="collapsed",
+        )
+        st.caption(f"{len(result.transcript or ''):,} characters · "
+                   f"~{len((result.transcript or '').split()):,} words")
 
 
-def render_cross_analysis(cross: dict, n_videos: int):
-    """Render the cross-video analysis panel."""
+def render_cross(cross: dict, n: int):
     st.divider()
-    st.subheader(f"🔍 Cross-Video Analysis ({n_videos} videos)")
-
+    st.subheader(f"🔍 Cross-Video Analysis ({n} videos)")
     if cross.get("overarching_themes"):
-        st.markdown("**Overarching Themes**")
-        st.markdown("  ".join(f"`{t}`" for t in cross["overarching_themes"]))
-
+        st.markdown("**Overarching Themes:** " +
+                    "  ".join(f"`{t}`" for t in cross["overarching_themes"]))
     if cross.get("common_narrative"):
-        st.markdown("**Common Narrative**")
         st.info(cross["common_narrative"])
-
     col1, col2 = st.columns(2)
     with col1:
         if cross.get("notable_patterns"):
@@ -318,13 +255,11 @@ def render_cross_analysis(cross: dict, n_videos: int):
         if cross.get("content_diversity"):
             st.markdown("**Content Diversity**")
             st.markdown(cross["content_diversity"])
-
     if cross.get("recommendations"):
-        st.markdown("**Recommendations**")
         st.success(cross["recommendations"])
 
 
-# ─── Main app ─────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
@@ -334,31 +269,38 @@ def main():
     )
 
     st.title("🎬 YouTube Transcript Analyzer")
-    st.caption("Paste YouTube URLs to extract transcripts, summarize each video, and identify cross-video patterns.")
+    st.caption("Free — uses YouTube captions + Google Gemini (free tier) for analysis.")
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Settings")
 
         api_key = st.text_input(
-            "Anthropic API Key",
-            value=os.getenv("ANTHROPIC_API_KEY", ""),
+            "Gemini API Key",
+            value=os.getenv("GEMINI_API_KEY", ""),
             type="password",
-            help="Your key from console.anthropic.com — or set ANTHROPIC_API_KEY in .env",
+            help="Free key from https://aistudio.google.com — no credit card needed",
+        )
+
+        analyze = st.toggle(
+            "Summarize with Gemini",
+            value=True,
+            help="Turn off to extract raw transcripts only — no API key needed at all",
         )
 
         st.markdown("---")
         st.markdown(
-            "**Model:** `claude-haiku-4-5`\n\n"
-            "Fast and cost-efficient for bulk transcript analysis. "
-            "Swap `MODEL` in the source for Sonnet if you need deeper reasoning."
+            "**Free tier limits (Gemini Flash)**\n"
+            "- 15 requests / minute\n"
+            "- 1,500 requests / day\n\n"
+            "Get your key → [aistudio.google.com](https://aistudio.google.com)"
         )
         st.markdown("---")
         st.markdown(
             "**Tips**\n"
-            "- Videos must have captions (auto-generated counts)\n"
+            "- Videos need captions (auto-generated counts)\n"
             "- Private / age-restricted videos will fail\n"
-            "- Long videos may be truncated before analysis"
+            "- Transcripts only mode needs no API key at all"
         )
 
     # ── URL input ─────────────────────────────────────────────────────────────
@@ -372,7 +314,7 @@ def main():
         ),
     )
 
-    urls = parse_urls(raw_input)
+    urls         = parse_urls(raw_input)
     valid_urls   = [u for u in urls if extract_video_id(u)]
     invalid_urls = [u for u in urls if not extract_video_id(u)]
 
@@ -385,21 +327,28 @@ def main():
                 for u in invalid_urls:
                     st.code(u)
 
-    run_disabled = not valid_urls or not api_key
+    needs_key   = analyze and not api_key
+    run_disabled = not valid_urls or needs_key
     run_button   = st.button(
-        f"Analyze {len(valid_urls)} video{'s' if len(valid_urls) != 1 else ''}",
+        f"{'Analyze' if analyze else 'Extract'} "
+        f"{len(valid_urls)} video{'s' if len(valid_urls) != 1 else ''}",
         type="primary",
         disabled=run_disabled,
     )
 
-    if not api_key:
-        st.warning("Enter your Anthropic API key in the sidebar to continue.")
+    if needs_key:
+        st.warning("Add a Gemini API key in the sidebar, or turn off 'Summarize with Gemini' to extract raw transcripts only.")
 
-    # ── Analysis ──────────────────────────────────────────────────────────────
-    if run_button and valid_urls and api_key:
-        client  = anthropic.Anthropic(api_key=api_key)
-        results = []
+    # ── Processing ────────────────────────────────────────────────────────────
+    if run_button and valid_urls:
 
+        # Set up Gemini only if summarization is on
+        gemini_model = None
+        if analyze and api_key:
+            genai.configure(api_key=api_key)
+            gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+        results      = []
         progress_bar = st.progress(0, text="Starting…")
         status_text  = st.empty()
 
@@ -408,22 +357,24 @@ def main():
             result   = VideoResult(url=url, video_id=video_id)
 
             # Step 1 — fetch transcript
-            status_text.markdown(f"**[{idx+1}/{len(valid_urls)}]** Fetching transcript for `{url}` …")
+            status_text.markdown(
+                f"**[{idx+1}/{len(valid_urls)}]** Fetching transcript for `{url}` …"
+            )
             try:
                 result.transcript = fetch_transcript(video_id)
             except Exception as e:
                 result.error = str(e)
 
-            # Step 2 — analyze with Claude
-            if result.transcript:
-                status_text.markdown(f"**[{idx+1}/{len(valid_urls)}]** Analyzing `{url}` with Claude…")
+            # Step 2 — analyze with Gemini (optional)
+            if result.transcript and gemini_model:
+                status_text.markdown(
+                    f"**[{idx+1}/{len(valid_urls)}]** Analyzing `{url}` with Gemini…"
+                )
                 try:
-                    result.analysis = analyze_transcript(client, result.transcript)
-                except anthropic.AuthenticationError:
-                    st.error("Invalid API key. Please check your key in the sidebar.")
-                    st.stop()
+                    result.analysis = analyze_transcript(gemini_model, result.transcript)
                 except Exception as e:
-                    result.error = f"Claude analysis failed: {e}"
+                    # Don't fail the whole result — just skip analysis
+                    st.warning(f"Gemini analysis failed for video {idx+1}: {e}")
 
             results.append(result)
             progress_bar.progress(
@@ -434,33 +385,31 @@ def main():
         progress_bar.empty()
         status_text.empty()
 
-        # ── Per-video results ─────────────────────────────────────────────────
+        # ── Results ───────────────────────────────────────────────────────────
         successful = [r for r in results if r.success]
         failed     = [r for r in results if not r.success]
-
-        st.markdown(
-            f"**Done.** {len(successful)} succeeded · {len(failed)} failed"
-        )
+        st.markdown(f"**Done.** {len(successful)} succeeded · {len(failed)} failed")
 
         for i, result in enumerate(results, 1):
-            render_analysis_card(result, i)
+            render_card(result, i)
 
         # ── Cross-video analysis ──────────────────────────────────────────────
         cross = None
-        if len(successful) > 1:
+        if gemini_model and len(successful) > 1:
             with st.spinner("Running cross-video analysis…"):
                 try:
-                    cross = cross_video_analysis(client, successful)
-                    render_cross_analysis(cross, len(successful))
+                    cross = cross_video_analysis(gemini_model, successful)
+                    render_cross(cross, len(successful))
                 except Exception as e:
                     st.warning(f"Cross-video analysis failed: {e}")
 
-        # ── Download button ───────────────────────────────────────────────────
-        report = export_results_as_text(results, cross)
+        # ── Download ──────────────────────────────────────────────────────────
+        st.divider()
+        report = export_report(results, cross)
         st.download_button(
             label="⬇️ Download full report (.txt)",
             data=report,
-            file_name="transcript_analysis.txt",
+            file_name="transcript_report.txt",
             mime="text/plain",
         )
 
